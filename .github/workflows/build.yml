@@ -1,8 +1,8 @@
-name: Build HighlightOutline
+name: Build plugins
 
 on:
   push:
-    branches: [main]
+    branches: [main, round-corners]
   pull_request:
   workflow_dispatch:
 
@@ -26,12 +26,22 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Build HighlightOutline
+      - name: Build plugins
         run: dotnet build HighlightOutline/HighlightOutline.csproj -c Release
 
-      - name: Upload plugin
+      - name: Build RoundCorners
+        run: dotnet build RoundCorners/RoundCorners.csproj -c Release
+
+      - name: Upload HighlightOutline
         uses: actions/upload-artifact@v4
         with:
           name: HighlightOutline
           path: HighlightOutline/bin/Release/**/HighlightOutline.dll
+          if-no-files-found: error
+
+      - name: Upload RoundCorners
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoundCorners
+          path: RoundCorners/bin/Release/**/RoundCorners.dll
           if-no-files-found: error
