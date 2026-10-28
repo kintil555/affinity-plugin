@@ -383,7 +383,10 @@ namespace HighlightOutline
             AddRow(grid, "Offset:", Ui.NumberSlider(model, "Offset", 0, 200, 0, "Pixel", false), 14);
             AddRow(grid, "Angle:", Ui.AngleDial(model, "Angle"), 14);
 
-            var colour = Ui.ColourButton(fx.GetColour(), fx.GetColourProfile(), fx.SetColour);
+            // A native popup button without a ColourProfile can throw while rendering and take the whole panel down.
+            var profile = fx.GetColourProfile();
+            var colour = profile != null ? Ui.ColourButton(fx.GetColour(), profile, fx.SetColour) : null;
+            if (profile == null) HighlightOutlinePlugin.Ctx?.LogWarning("ColourProfile unavailable; colour button skipped");
             if (colour != null) AddRow(grid, "Color:", colour, 14);
 
             var apply = new Button { Content = "Apply", Margin = new Thickness(0, 14, 0, 0), Padding = new Thickness(0, 5, 0, 5) };
@@ -392,6 +395,13 @@ namespace HighlightOutline
             Grid.SetColumnSpan(apply, 2);
             grid.Children.Add(apply);
             win.Content = grid;
+
+            // Keep the panel alive if one native control throws during layout/render; log instead.
+            win.Dispatcher.UnhandledException += (s, e) =>
+            {
+                HighlightOutlinePlugin.Ctx?.LogError("Panel UI exception", e.Exception);
+                e.Handled = true;
+            };
 
             bool applied = false;
             apply.Click += (s, e) => { applied = true; win.Close(); };
