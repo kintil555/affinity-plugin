@@ -505,13 +505,8 @@ namespace HighlightOutline
                     if (conv.CanConvertFrom(typeof(string))) slider.SetValue(rangesDp, conv.ConvertFromString("100,1"));
                 }
 
-                var convType = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.UI.Colour.AlphaGradientConverter");
-                var imgDp = (DependencyProperty)rangeType.GetField("RangeImageProperty", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-                if (convType != null && imgDp != null && colour != null)
-                {
-                    var img = ((IValueConverter)Activator.CreateInstance(convType)).Convert(colour, imgDp.PropertyType, colourProfile, System.Globalization.CultureInfo.InvariantCulture);
-                    if (img != null && img != DependencyProperty.UnsetValue) slider.SetValue(imgDp, img);
-                }
+                // RangeImage (AlphaGradientConverter) is skipped: built without a bound ColourProfile it makes
+                // ColoursSource.GenerateBuffer throw a NullReference during Arrange and kills the whole panel.
             }
             catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogWarning("Opacity look partially applied: " + ex.Message); }
         }
