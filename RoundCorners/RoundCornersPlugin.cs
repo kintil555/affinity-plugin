@@ -33,6 +33,7 @@ namespace RoundCorners
         }
 
         static object _item;
+        static int _diag;
 
         // Same approach as HighlightOutline: copy the read-only ItemsSource, insert a real WorkspaceMenuItem after "Duplicate".
         public static void OnOpened_Prefix(ContextMenu __instance)
@@ -45,8 +46,21 @@ namespace RoundCorners
                 if (items.Contains(_item)) return;
 
                 var textProp = wmi.GetProperty("Text");
-                int dup = items.FindIndex(o => wmi.IsInstanceOfType(o) && (string)textProp.GetValue(o) == "Duplicate");
-                if (dup < 0) return;
+                var cmdProp = wmi.GetProperty("Command");
+                // Match like HighlightOutline does: by command type first (Text can be localised/null), then by text.
+                int dup = items.FindIndex(o =>
+                {
+                    if (!wmi.IsInstanceOfType(o)) return false;
+                    var c = cmdProp.GetValue(o);
+                    return (c != null && c.GetType().Name == "DuplicateObjectsIgnorePixelSelectionCommand")
+                        || (string)textProp.GetValue(o) == "Duplicate";
+                });
+                if (dup < 0)
+                {
+                    if (_diag++ < 3)
+                        Ctx?.Log("Menu not matched. Items: " + string.Join(" | ", items.Select(o => wmi.IsInstanceOfType(o) ? (string)textProp.GetValue(o) ?? "<null>" : o.GetType().Name)));
+                    return;
+                }
 
                 if (_item == null)
                 {
