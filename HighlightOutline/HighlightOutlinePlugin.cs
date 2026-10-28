@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Linq;
 using System.Reflection;
@@ -51,30 +51,45 @@ namespace HighlightOutline
         static object _toolsItem;   // our WorkspaceMenuItem (reused)
         static int _diagLogged;
 
-        // The menu is data-bound to WorkspaceMenuItem objects (UpdateState casts each item to it),
-        // so we add a real WorkspaceMenuItem before UpdateState runs.
+        // The layer menu's ItemsSource is a ReadOnlyCollection (LayerView.TryMakeMenu uses List.AsReadOnly()),
+        // so it cannot be modified in place. Copy it into a new List, insert our item, and swap ItemsSource.
+        // UpdateState (runs in base OnOpened path) casts each item to WorkspaceMenuItem, so we use a real one.
         public static void OnOpened_Prefix(ContextMenu __instance)
         {
             try
             {
                 var wmiType = Asm(AffinityAsm).GetType("Serif.Affinity.Workspaces.WorkspaceMenuItem", true);
-                var list = (__instance.ItemsSource as IList) ?? (IList)__instance.Items;
-                if (list == null || list.IsReadOnly || list.IsFixedSize) return;
+                var src = (__instance.ItemsSource as IEnumerable) ?? __instance.Items;
+                var items = src.Cast<object>().Where(o => o != null).ToList();
+                if (items.Contains(_toolsItem)) return;
 
                 var textProp = wmiType.GetProperty("Text");
-                var texts = list.Cast<object>().Where(o => wmiType.IsInstanceOfType(o))
-                                .Select(o => (string)textProp.GetValue(o)).ToList();
-                int dup = texts.IndexOf("Duplicate");
-                if (dup < 0 || !texts.Contains("Merge Down"))
+                var cmdProp = wmiType.GetProperty("Command");
+                int dup = items.FindIndex(o =>
                 {
-                    if (_diagLogged++ < 3) Ctx?.Log("Menu not matched. Items: " + string.Join(" | ", texts));
+                    if (!wmiType.IsInstanceOfType(o)) return false;
+                    var cmd = cmdProp.GetValue(o);
+                    return (cmd != null && cmd.GetType().Name == "DuplicateObjectsIgnorePixelSelectionCommand")
+                        || (string)textProp.GetValue(o) == "Duplicate";
+                });
+                if (dup < 0)
+                {
+                    if (_diagLogged++ < 3)
+                        Ctx?.Log("Menu not matched. Items: " + string.Join(" | ",
+                            items.Select(o => wmiType.IsInstanceOfType(o) ? (string)textProp.GetValue(o) ?? "<null>" : o.GetType().Name)));
                     return;
                 }
-                if (_toolsItem == null) _toolsItem = BuildToolsItem(wmiType);
-                if (list.Contains(_toolsItem)) return;
 
-                list.Insert(dup + 1, _toolsItem);
-                __instance.Items.Refresh();
+                if (_toolsItem == null) _toolsItem = BuildToolsItem(wmiType);
+
+                var listType = typeof(System.Collections.Generic.List<>).MakeGenericType(wmiType);
+                var newList = (IList)Activator.CreateInstance(listType);
+                for (int i = 0; i < items.Count; i++)
+                {
+                    newList.Add(items[i]);
+                    if (i == dup) newList.Add(_toolsItem);
+                }
+                __instance.ItemsSource = newList;
             }
             catch (Exception ex) { Ctx?.LogError("Context menu patch failed", ex); }
         }
