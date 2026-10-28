@@ -1,0 +1,37 @@
+name: Build HighlightOutline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch AffinityPluginLoader sources
+        uses: actions/checkout@v4
+        with:
+          repository: noahc3/AffinityPluginLoader
+          path: _apl
+
+      - name: Place AffinityPluginLoader next to plugin
+        shell: pwsh
+        run: Copy-Item -Recurse _apl/AffinityPluginLoader AffinityPluginLoader
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build HighlightOutline
+        run: dotnet build HighlightOutline/HighlightOutline.csproj -c Release
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: HighlightOutline
+          path: HighlightOutline/bin/Release/**/HighlightOutline.dll
+          if-no-files-found: error
