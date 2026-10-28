@@ -312,7 +312,7 @@ namespace HighlightOutline
                         break;
                     case "Angle":
                         SetAll("EffectsDataSourceItemOffsetAngleParam", "Value2", m.Angle);    // Value2 = angle (degrees)
-                        SetAll("EffectsDataSourceItemAngleParam", "Value1", m.Angle);
+                        SetAll("EffectsDataSourceItemAngleParam", "Value2", m.Angle);   // AngleParam shares the offset/angle pair: Value1 = offset, Value2 = angle
                         break;
                 }
             }
