@@ -150,7 +150,7 @@ namespace HighlightOutline
 
                 var panelIface = FindType("IPanelService");
                 var panelSvc = GetService(panelIface);
-                panelIface.GetMethod("ShowLayerEffectsDialog").Invoke(panelSvc, new object[] { selection, shadowType });
+                panelSvc.GetType().GetMethod("ShowLayerEffectsDialog").Invoke(panelSvc, new object[] { selection, shadowType });
 
                 const BindingFlags nb = BindingFlags.NonPublic | BindingFlags.Instance;
                 var dlg = panelSvc.GetType().GetField("layerEffectsDialog", nb).GetValue(panelSvc);
@@ -158,8 +158,12 @@ namespace HighlightOutline
                 if (ReferenceEquals(dlg, _dialog)) return;     // already open and initialised
                 _dialog = dlg;
 
-                new FxSession(ds).ApplyDefaults();
-                HookApplyButton((Window)dlg);
+                var win = (Window)dlg;
+                HookApplyButton(win);
+                var fx = new FxSession(ds);
+                fx.ApplyDefaults();                         // now
+                win.Dispatcher.BeginInvoke(new Action(fx.ApplyDefaults),
+                    System.Windows.Threading.DispatcherPriority.ApplicationIdle);   // again once the UI has bound
             }
             catch (Exception ex) { Ctx?.LogError("Open panel failed", ex); }
         }
@@ -253,35 +257,70 @@ namespace HighlightOutline
             _item = effects.Cast<object>().First(e => e.GetType().Name == "EffectsDataSourceItemInnerShadow");
         }
 
-        /// <summary>Enable Inner Shadow: radius 0, offset 10, intensity 0, fill opacity 0%.</summary>
+        // Defaults (all editable afterwards in the dialog).
+        const double EffectOpacity = 1.0;   // "Opacity" slider of the Inner Shadow, 0..1 (100%)
+        const double FillOpacityPct = 0.0;  // "Fill Opacity" of the layer (0%)
+        const double Radius = 0, Offset = 10, Intensity = 0;
+
+        /// <summary>Enable Inner Shadow and set: opacity 100%, radius 0, offset 10, intensity 0, fill opacity 0%.</summary>
         public void ApplyDefaults()
         {
-            _dsType.GetMethod("EnableEffect").Invoke(_ds, new[] { _item });
-
-            var uv = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitValue");
-            var ut = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitType");
-            var zero = Activator.CreateInstance(uv, 0.0, Enum.Parse(ut, "Percentage"));
-            _dsType.GetProperty("FillOpacity").SetValue(_ds, zero);
-
-            SetRadius(0); SetOffset(10); SetIntensity(0);
+            Step("enable effect", () =>
+            {
+                var enabled = (bool)HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.IEffectsDataSourceItem")
+                    .GetProperty("IsEnabled").GetValue(_item);
+                if (!enabled) _dsType.GetMethod("EnableEffect").Invoke(_ds, new[] { _item });
+            });
+            Step("fill opacity", SetFillOpacity);
+            Step("opacity", () => SetParam("EffectsDataSourceItemOpacityParam", "Value", EffectOpacity));
+            Step("radius", () => SetParam("EffectsDataSourceItemRadiusParam", "Value", Radius));
+            Step("offset", () =>
+            {
+                if (Param("EffectsDataSourceItemOffsetParam") != null) SetParam("EffectsDataSourceItemOffsetParam", "Value", Offset);
+                else SetParam("EffectsDataSourceItemOffsetAngleParam", "Value1", Offset);   // Value1 = offset, Value2 = angle
+            });
+            Step("intensity", () => SetParam("EffectsDataSourceItemIntensityParam", "Value", Intensity));
         }
 
-        object Param(string typeName) =>
-            ((IEnumerable)HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.IEffectsDataSourceItem")
-                .GetProperty("Params").GetValue(_item))
-                .Cast<object>().FirstOrDefault(p => p.GetType().Name == typeName);
-
-        void Edit(object p, Action set)
+        static void Step(string name, Action a)
         {
+            try { a(); }
+            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Default '" + name + "' failed", ex); }
+        }
+
+        void SetFillOpacity()
+        {
+            var uv = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitValue");
+            var ut = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitType");
+            // UnitValue has two (double, UnitType) ctors differing only by modopt, so pick one explicitly.
+            var ctor = uv.GetConstructors().First(c =>
+            {
+                var ps = c.GetParameters();
+                return ps.Length == 2 && ps[0].ParameterType == typeof(double) && ps[1].ParameterType == ut;
+            });
+            var val = ctor.Invoke(new object[] { FillOpacityPct, Enum.Parse(ut, "Percentage") });
+            _dsType.GetProperty("FillOpacity").SetValue(_ds, val);
+        }
+
+        // Params the dialog UI is bound to (CurrentParams); fall back to the item's full list.
+        IEnumerable<object> Params()
+        {
+            var cur = (_dsType.GetProperty("CurrentParams")?.GetValue(_ds) as IEnumerable)?.Cast<object>().ToList();
+            if (cur != null && cur.Count > 0) return cur;
+            return ((IEnumerable)HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.IEffectsDataSourceItem")
+                .GetProperty("Params").GetValue(_item)).Cast<object>();
+        }
+
+        object Param(string typeName) => Params().FirstOrDefault(p => p.GetType().Name == typeName);
+
+        void SetParam(string typeName, string prop, double v)
+        {
+            var p = Param(typeName);
+            if (p == null) { HighlightOutlinePlugin.Ctx?.LogWarning("Param not found: " + typeName); return; }
             _dsType.GetMethod("BeginEditEffect").Invoke(_ds, new[] { p });
-            set();
+            p.GetType().GetProperty(prop).SetValue(p, v);
             _dsType.GetMethod("ContinueEditEffect").Invoke(_ds, new[] { p });
             _dsType.GetMethod("EndEditEffect").Invoke(_ds, new[] { p });
         }
-
-        public void SetRadius(double v) { var p = Param("EffectsDataSourceItemRadiusParam"); Edit(p, () => p.GetType().GetProperty("Value").SetValue(p, v)); }
-        public void SetIntensity(double v) { var p = Param("EffectsDataSourceItemIntensityParam"); Edit(p, () => p.GetType().GetProperty("Value").SetValue(p, v)); }
-        // Value1 = offset, Value2 = angle (order assumed; verify in-app)
-        public void SetOffset(double v) { var p = Param("EffectsDataSourceItemOffsetAngleParam"); Edit(p, () => p.GetType().GetProperty("Value1").SetValue(p, v)); }
     }
 }
