@@ -26,9 +26,7 @@ namespace HighlightOutline
             {
                 var t = Asm(AffinityAsm).GetType("Serif.Affinity.UI.AffinityContextMenu", true);
                 var m = t.GetMethod("OnOpened", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
-                h.Patch(m,
-                    prefix: new HarmonyMethod(typeof(HighlightOutlinePlugin), nameof(OnOpened_Prefix)),
-                    postfix: new HarmonyMethod(typeof(HighlightOutlinePlugin), nameof(OnOpened_Postfix)));
+                h.Patch(m, prefix: new HarmonyMethod(typeof(HighlightOutlinePlugin), nameof(OnOpened_Prefix)));
                 context.Log("Patched AffinityContextMenu.OnOpened");
             });
 
@@ -50,38 +48,80 @@ namespace HighlightOutline
             return false;
         }
 
-        const string MenuTag = "apl-highlight";
+        static object _toolsItem;   // our WorkspaceMenuItem (reused)
+        static int _diagLogged;
 
-        // UpdateState casts every item to WorkspaceMenuItem, so our plain items must be gone before it runs.
+        // The menu is data-bound to WorkspaceMenuItem objects (UpdateState casts each item to it),
+        // so we add a real WorkspaceMenuItem before UpdateState runs.
         public static void OnOpened_Prefix(ContextMenu __instance)
         {
             try
             {
-                foreach (var i in __instance.Items.OfType<FrameworkElement>().Where(i => (string)i.Tag == MenuTag).ToList())
-                    __instance.Items.Remove(i);
-            }
-            catch (Exception ex) { Ctx?.LogError("Context menu cleanup failed", ex); }
-        }
+                var wmiType = Asm(AffinityAsm).GetType("Serif.Affinity.Workspaces.WorkspaceMenuItem", true);
+                var list = (__instance.ItemsSource as IList) ?? (IList)__instance.Items;
+                if (list == null || list.IsReadOnly || list.IsFixedSize) return;
 
-        public static void OnOpened_Postfix(ContextMenu __instance)
-        {
-            try
-            {
-                var headers = __instance.Items.OfType<MenuItem>().Select(i => i.Header as string).ToList();
-                // Only the layer/object menu (has Duplicate + Merge Down)
-                int dup = headers.IndexOf("Duplicate");
-                if (dup < 0 || !headers.Contains("Merge Down")) return;
+                var textProp = wmiType.GetProperty("Text");
+                var texts = list.Cast<object>().Where(o => wmiType.IsInstanceOfType(o))
+                                .Select(o => (string)textProp.GetValue(o)).ToList();
+                int dup = texts.IndexOf("Duplicate");
+                if (dup < 0 || !texts.Contains("Merge Down"))
+                {
+                    if (_diagLogged++ < 3) Ctx?.Log("Menu not matched. Items: " + string.Join(" | ", texts));
+                    return;
+                }
+                if (_toolsItem == null) _toolsItem = BuildToolsItem(wmiType);
+                if (list.Contains(_toolsItem)) return;
 
-                var tools = new MenuItem { Header = "Tools", Tag = MenuTag };
-                var item = new MenuItem { Header = "Highlight Outline" };
-                item.Click += (s, e) => OpenPanel();
-                tools.Items.Add(item);
-                __instance.Items.Insert(dup + 1, tools);
+                list.Insert(dup + 1, _toolsItem);
+                __instance.Items.Refresh();
             }
             catch (Exception ex) { Ctx?.LogError("Context menu patch failed", ex); }
         }
 
-        static void OpenPanel()
+        static object BuildToolsItem(Type wmiType)
+        {
+            var cmdType = PType("Serif.Interop.Persona.Commands.Command");
+            var cmd = Activator.CreateInstance(MakeCommandType(cmdType));
+
+            var child = wmiType.GetConstructor(new[] { typeof(string), cmdType }).Invoke(new[] { "Highlight Outline", cmd });
+            var listType = typeof(System.Collections.Generic.List<>).MakeGenericType(wmiType);
+            var children = (IList)Activator.CreateInstance(listType);
+            children.Add(child);
+            var ilist = typeof(System.Collections.Generic.IList<>).MakeGenericType(wmiType);
+            return wmiType.GetConstructor(new[] { typeof(string), ilist }).Invoke(new object[] { "Tools", children });
+        }
+
+        // Runtime subclass of Serif's abstract Command: Execute opens our panel.
+        static Type MakeCommandType(Type baseType)
+        {
+            var ab = System.Reflection.Emit.AssemblyBuilder.DefineDynamicAssembly(
+                new AssemblyName("HighlightOutline.Dyn"), System.Reflection.Emit.AssemblyBuilderAccess.Run);
+            var mb = ab.DefineDynamicModule("m");
+            var tb = mb.DefineType("HighlightOutlineCommand", TypeAttributes.Public | TypeAttributes.Class, baseType);
+
+            var baseCtor = baseType.GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Type.EmptyTypes, null);
+            var ctor = tb.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, Type.EmptyTypes);
+            var il = ctor.GetILGenerator();
+            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_0);
+            il.Emit(System.Reflection.Emit.OpCodes.Call, baseCtor);
+            il.Emit(System.Reflection.Emit.OpCodes.Ret);
+
+            var attrs = MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig;
+            var exec = tb.DefineMethod("Execute", attrs, typeof(void), new[] { typeof(object) });
+            il = exec.GetILGenerator();
+            il.Emit(System.Reflection.Emit.OpCodes.Call, typeof(HighlightOutlinePlugin).GetMethod(nameof(OpenPanel), BindingFlags.Public | BindingFlags.Static));
+            il.Emit(System.Reflection.Emit.OpCodes.Ret);
+
+            var can = tb.DefineMethod("CanExecute", attrs, typeof(bool), new[] { typeof(object) });
+            il = can.GetILGenerator();
+            il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4_1);
+            il.Emit(System.Reflection.Emit.OpCodes.Ret);
+
+            return tb.CreateType();
+        }
+
+        public static void OpenPanel()
         {
             try { new HighlightPanel().Show(); }
             catch (Exception ex) { Ctx?.LogError("Open panel failed", ex); }
