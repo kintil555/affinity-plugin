@@ -284,6 +284,11 @@ namespace HighlightOutline
             return p?.GetType().GetProperty("Value").GetValue(p);
         }
 
+        public object GetColourProfile()
+        {
+            try { return _dsType.GetProperty("ColourProfile")?.GetValue(_ds); } catch { return null; }
+        }
+
         public void SetColour(object colour) { SetAll("EffectsDataSourceItemColourParam", "Value", colour); }
 
         public void PushAll(FxModel m)
@@ -374,11 +379,11 @@ namespace HighlightOutline
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
             // Same rows as the design: Opacity, Offset, Angle, Color (Radius/Fill/Intensity stay at fixed defaults).
-            AddRow(grid, "Opacity:", Ui.NumberSlider(model, "Opacity", 0, 100, 0, "Percentage", true), 10);
+            AddRow(grid, "Opacity:", Ui.NumberSlider(model, "Opacity", 0, 100, 0, "Percentage", true, fx.GetColour(), fx.GetColourProfile()), 10);
             AddRow(grid, "Offset:", Ui.NumberSlider(model, "Offset", 0, 200, 0, "Pixel", false), 14);
             AddRow(grid, "Angle:", Ui.AngleDial(model, "Angle"), 14);
 
-            var colour = Ui.ColourButton(fx.GetColour(), fx.SetColour);
+            var colour = Ui.ColourButton(fx.GetColour(), fx.GetColourProfile(), fx.SetColour);
             if (colour != null) AddRow(grid, "Color:", colour, 14);
 
             var apply = new Button { Content = "Apply", Margin = new Thickness(0, 14, 0, 0), Padding = new Thickness(0, 5, 0, 5) };
@@ -461,32 +466,44 @@ namespace HighlightOutline
             tb.Foreground = System.Windows.Media.Brushes.Gainsboro;
         }
 
-        // Checkerboard + transparent->dark gradient, used as the Opacity track backdrop.
-        static FrameworkElement CheckerTrack()
+        // Key of a SchemeManager brush (Affinity uses the static property value as the resource key).
+        static object SchemeKey(string name)
         {
-            var checker = new System.Windows.Media.DrawingBrush
+            try
             {
-                TileMode = System.Windows.Media.TileMode.Tile,
-                Viewport = new Rect(0, 0, 8, 8),
-                ViewportUnits = System.Windows.Media.BrushMappingMode.Absolute,
-                Drawing = new System.Windows.Media.DrawingGroup
+                var t = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.Resources.Schemes.SchemeManager");
+                return t?.GetProperty(name, BindingFlags.Public | BindingFlags.Static)?.GetValue(null)
+                    ?? t?.GetField(name, BindingFlags.Public | BindingFlags.Static)?.GetValue(null)
+                    ?? name;
+            }
+            catch { return name; }
+        }
+
+        // Affinity's own opacity-slider look: ColourSliderStyle + Brush_Checkerboard + AlphaGradientConverter(RangeImage).
+        static void ApplyOpacityLook(Slider slider, Type rangeType, object colour, object colourProfile)
+        {
+            try
+            {
+                var style = Application.Current.TryFindResource("ColourSliderStyle") as Style;
+                if (style != null) slider.Style = style;
+                slider.SetResourceReference(Control.BackgroundProperty, SchemeKey("Brush_Checkerboard"));
+
+                var rangesDp = (DependencyProperty)rangeType.GetField("RangesProperty", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                if (rangesDp != null)
                 {
-                    Children =
-                    {
-                        new System.Windows.Media.GeometryDrawing(System.Windows.Media.Brushes.White, null, new System.Windows.Media.RectangleGeometry(new Rect(0, 0, 8, 8))),
-                        new System.Windows.Media.GeometryDrawing(System.Windows.Media.Brushes.LightGray, null, new System.Windows.Media.GeometryGroup
-                        {
-                            Children = { new System.Windows.Media.RectangleGeometry(new Rect(0, 0, 4, 4)), new System.Windows.Media.RectangleGeometry(new Rect(4, 4, 4, 4)) }
-                        })
-                    }
+                    var conv = System.ComponentModel.TypeDescriptor.GetConverter(rangesDp.PropertyType);
+                    if (conv.CanConvertFrom(typeof(string))) slider.SetValue(rangesDp, conv.ConvertFromString("100,1"));
                 }
-            };
-            var fade = new System.Windows.Media.LinearGradientBrush(
-                System.Windows.Media.Color.FromArgb(0, 30, 30, 30), System.Windows.Media.Color.FromArgb(255, 30, 30, 30), 0);
-            var g = new Grid { Height = 12, IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
-            g.Children.Add(new Border { Background = checker, CornerRadius = new CornerRadius(6) });
-            g.Children.Add(new Border { Background = fade, CornerRadius = new CornerRadius(6) });
-            return g;
+
+                var convType = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.UI.Colour.AlphaGradientConverter");
+                var imgDp = (DependencyProperty)rangeType.GetField("RangeImageProperty", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                if (convType != null && imgDp != null && colour != null)
+                {
+                    var img = ((IValueConverter)Activator.CreateInstance(convType)).Convert(colour, imgDp.PropertyType, colourProfile, System.Globalization.CultureInfo.InvariantCulture);
+                    if (img != null && img != DependencyProperty.UnsetValue) slider.SetValue(imgDp, img);
+                }
+            }
+            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogWarning("Opacity look partially applied: " + ex.Message); }
         }
 
         /// <summary>Affinity RoundSlider (circular angle dial with degree readout).</summary>
@@ -504,6 +521,7 @@ namespace HighlightOutline
                     b.Converter = new DoubleToUnitValue(_unitValue, Enum.Parse(_unitType, "Degree"));
                 }
                 dial.SetBinding(dp, b);
+                SetDp(t, dial, "Reverse", true);   // Affinity shadow angle runs counter-clockwise
                 SetDp(t, dial, "FullDegreeMode", true);
                 SetDp(t, dial, "Precision", 0);
                 dial.Width = 64; dial.Height = 64;
@@ -517,7 +535,7 @@ namespace HighlightOutline
             }
         }
 
-        public static FrameworkElement NumberSlider(object model, string prop, double min, double max, int precision, string unit = "Number", bool checker = false)
+        public static FrameworkElement NumberSlider(object model, string prop, double min, double max, int precision, string unit = "Number", bool checker = false, object colour = null, object colourProfile = null)
         {
             Resolve();
             var binding = new Binding(prop) { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged };
@@ -529,6 +547,7 @@ namespace HighlightOutline
                 var slider = (Slider)Activator.CreateInstance(_range);
                 slider.Minimum = min; slider.Maximum = max;
                 slider.VerticalAlignment = VerticalAlignment.Center;
+                if (checker) ApplyOpacityLook(slider, _range, colour, colourProfile);
                 slider.SetBinding(System.Windows.Controls.Primitives.RangeBase.ValueProperty, binding);
 
                 var editor = (Control)Activator.CreateInstance(_editor);
@@ -549,7 +568,6 @@ namespace HighlightOutline
                 g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 Grid.SetColumn(editor, 1);
-                if (checker) g.Children.Add(CheckerTrack());
                 g.Children.Add(slider); g.Children.Add(editor);
                 return g;
             }
@@ -573,25 +591,24 @@ namespace HighlightOutline
             }
         }
 
-        /// <summary>Affinity's ColourPickerButton bound to the Persona Colour of the effect; null if unavailable.</summary>
-        public static FrameworkElement ColourButton(object initial, Action<object> changed)
+        /// <summary>Affinity's ColourEditorPopupButton (swatch + popup picker) bound to the effect colour; null if unavailable.</summary>
+        public static FrameworkElement ColourButton(object initial, object colourProfile, Action<object> changed)
         {
             try
             {
-                var t = HighlightOutlinePlugin.FindTypeAnywhere("ColourPickerButton");
-                if (t == null || initial == null) { HighlightOutlinePlugin.Ctx?.LogWarning("ColourPickerButton not found"); return null; }
+                var t = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.UI.Controls.ColourEditorPopupButton");
+                if (t == null || initial == null) { HighlightOutlinePlugin.Ctx?.LogWarning("ColourEditorPopupButton not found"); return null; }
                 var btn = (FrameworkElement)Activator.CreateInstance(t);
 
-                DependencyProperty dp = null;
-                for (var tt = t; tt != null && dp == null; tt = tt.BaseType)
-                    foreach (var f in tt.GetFields(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly))
-                    {
-                        if (f.FieldType != typeof(DependencyProperty)) continue;
-                        var d = (DependencyProperty)f.GetValue(null);
-                        if (d.PropertyType != typeof(object) && d.PropertyType.IsAssignableFrom(initial.GetType())
-                            && d.PropertyType.Name.Contains("Colour")) { dp = d; break; }
-                    }
-                if (dp == null) { HighlightOutlinePlugin.Ctx?.LogWarning("ColourPickerButton has no Colour property"); return null; }
+                var dp = (DependencyProperty)t.GetField("ColourProperty", BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)?.GetValue(null);
+                if (dp == null) { HighlightOutlinePlugin.Ctx?.LogWarning("ColourEditorPopupButton has no Colour property"); return null; }
+
+                var cpDp = t.GetField("ColourProfileProperty", BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)?.GetValue(null) as DependencyProperty;
+                if (cpDp != null && colourProfile != null) btn.SetValue(cpDp, colourProfile);
+                SetDp(t, btn, "IsPickerVisible", true);
+                SetDp(t, btn, "IsNoneVisible", false);
+                var anm = t.GetField("AlphaNoiseModeProperty", BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy)?.GetValue(null) as DependencyProperty;
+                if (anm != null) btn.SetValue(anm, Enum.Parse(anm.PropertyType, "None"));
 
                 btn.SetValue(dp, initial);
                 System.ComponentModel.DependencyPropertyDescriptor.FromProperty(dp, t)
