@@ -136,10 +136,100 @@ namespace HighlightOutline
             return tb.CreateType();
         }
 
+        static object _dialog;      // Affinity's native LayerEffectsDialog
+        static bool _applyRequested;
+
+        // Opens Affinity's own Layer Effects dialog (native UI: colour picker, opacity, angle, radius...)
+        // on the current selection with Inner Shadow preselected and our defaults applied.
         public static void OpenPanel()
         {
-            try { new HighlightPanel().Show(); }
+            try
+            {
+                var selection = GetSelection();
+                var shadowType = PType("Serif.Interop.Persona.Data.EffectsDataSourceItemInnerShadow");
+
+                var panelIface = FindType("IPanelService");
+                var panelSvc = GetService(panelIface);
+                panelIface.GetMethod("ShowLayerEffectsDialog").Invoke(panelSvc, new object[] { selection, shadowType });
+
+                const BindingFlags nb = BindingFlags.NonPublic | BindingFlags.Instance;
+                var dlg = panelSvc.GetType().GetField("layerEffectsDialog", nb).GetValue(panelSvc);
+                var ds = dlg.GetType().GetField("_dataSource", nb).GetValue(dlg);
+                if (ReferenceEquals(dlg, _dialog)) return;     // already open and initialised
+                _dialog = dlg;
+
+                new FxSession(ds).ApplyDefaults();
+                HookApplyButton((Window)dlg);
+            }
             catch (Exception ex) { Ctx?.LogError("Open panel failed", ex); }
+        }
+
+        // Reuse the dialog's accept button as "Apply": it closes the dialog (committing the FX),
+        // then we rasterise without preserving layer FX.
+        static void HookApplyButton(Window dlg)
+        {
+            var btn = dlg.GetType().GetField("AcceptButton", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                         ?.GetValue(dlg) as Button;
+            if (btn != null)
+            {
+                btn.Content = "Apply";
+                btn.Click += (s, e) => _applyRequested = true;
+            }
+            else Ctx?.LogWarning("Dialog accept button not found; closing the dialog will not rasterise");
+
+            dlg.Closed += (s, e) =>
+            {
+                _dialog = null;
+                if (!_applyRequested) return;
+                _applyRequested = false;
+                dlg.Dispatcher.BeginInvoke(new Action(RasteriseSelection));
+            };
+        }
+
+        // Rasterise with "Preserve Layer FX" off so the FX become plain pixels.
+        static void RasteriseSelection()
+        {
+            try
+            {
+                var t = PType("Serif.Interop.Persona.Commands.RasteriseCommand");
+                var cmd = Activator.CreateInstance(t);
+                if (!(bool)t.GetMethod("CanExecute").Invoke(cmd, new object[] { null }))
+                { Ctx?.LogWarning("Rasterise not available for selection"); return; }
+
+                SuppressRasteriseDialog = true;
+                try { t.GetMethod("Execute").Invoke(cmd, new object[] { null }); }
+                finally { SuppressRasteriseDialog = false; }
+            }
+            catch (Exception ex) { Ctx?.LogError("Rasterise failed", ex); }
+        }
+
+        internal static object GetService(Type serviceType)
+        {
+            var app = Application.Current;
+            var m = app.GetType().GetMethods()
+                .First(x => x.Name == "GetService" && x.IsGenericMethod && x.GetParameters().Length == 0)
+                .MakeGenericMethod(serviceType);
+            return m.Invoke(app, null);
+        }
+
+        internal static object GetSelection()
+        {
+            var viewSvc = GetService(PType("Serif.Interop.Persona.Services.IDocumentViewService"));
+            var doc = viewSvc.GetType().GetProperty("CurrentDocument").GetValue(viewSvc);
+            return doc.GetType().GetProperty("Selection").GetValue(doc);
+        }
+
+        internal static Type FindType(string name)
+        {
+            foreach (var asm in new[] { Asm(AffinityAsm), Asm(PersonaAsm) })
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException e) { types = e.Types.Where(x => x != null).ToArray(); }
+                var t = types.FirstOrDefault(x => x.Name == name);
+                if (t != null) return t;
+            }
+            throw new TypeLoadException(name);
         }
 
         internal static Assembly Asm(string name) =>
@@ -149,41 +239,36 @@ namespace HighlightOutline
     }
 
     /// <summary>Wraps Affinity's EffectsDataSource to edit Inner Shadow on the current selection.</summary>
-    internal sealed class FxSession : IDisposable
+    internal sealed class FxSession
     {
         readonly object _ds;
         readonly object _item;
         readonly Type _dsType;
 
-        public FxSession()
+        public FxSession(object dataSource)
         {
-            var app = Application.Current;
-            var viewSvcType = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Services.IDocumentViewService");
-            var getSvc = app.GetType().GetMethods()
-                .First(m => m.Name == "GetService" && m.IsGenericMethod && m.GetParameters().Length == 0)
-                .MakeGenericMethod(viewSvcType);
-            var viewSvc = getSvc.Invoke(app, null);
-            var doc = viewSvcType.GetProperty("CurrentDocument").GetValue(viewSvc);
-            var selection = doc.GetType().GetProperty("Selection").GetValue(doc);
-
-            _dsType = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.EffectsDataSource");
-            _ds = Activator.CreateInstance(_dsType, app, false);
-            _dsType.GetMethod("Initialise").Invoke(_ds, new[] { selection });
-            _dsType.GetMethod("Activate").Invoke(_ds, null);
-
+            _ds = dataSource;
+            _dsType = _ds.GetType();
             var effects = (IEnumerable)_dsType.GetProperty("Effects").GetValue(_ds);
             _item = effects.Cast<object>().First(e => e.GetType().Name == "EffectsDataSourceItemInnerShadow");
+        }
+
+        /// <summary>Enable Inner Shadow: radius 0, offset 10, intensity 0, fill opacity 0%.</summary>
+        public void ApplyDefaults()
+        {
             _dsType.GetMethod("EnableEffect").Invoke(_ds, new[] { _item });
 
-            // Fill opacity 0%
             var uv = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitValue");
             var ut = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitType");
             var zero = Activator.CreateInstance(uv, 0.0, Enum.Parse(ut, "Percentage"));
             _dsType.GetProperty("FillOpacity").SetValue(_ds, zero);
+
+            SetRadius(0); SetOffset(10); SetIntensity(0);
         }
 
         object Param(string typeName) =>
-            ((IEnumerable)_item.GetType().GetProperty("Params").GetValue(_item))
+            ((IEnumerable)HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.IEffectsDataSourceItem")
+                .GetProperty("Params").GetValue(_item))
                 .Cast<object>().FirstOrDefault(p => p.GetType().Name == typeName);
 
         void Edit(object p, Action set)
@@ -198,79 +283,5 @@ namespace HighlightOutline
         public void SetIntensity(double v) { var p = Param("EffectsDataSourceItemIntensityParam"); Edit(p, () => p.GetType().GetProperty("Value").SetValue(p, v)); }
         // Value1 = offset, Value2 = angle (order assumed; verify in-app)
         public void SetOffset(double v) { var p = Param("EffectsDataSourceItemOffsetAngleParam"); Edit(p, () => p.GetType().GetProperty("Value1").SetValue(p, v)); }
-
-        public void Dispose()
-        {
-            try { _dsType.GetMethod("Deactivate").Invoke(_ds, null); } catch { }
-            (_ds as IDisposable)?.Dispose();
-        }
-    }
-
-    internal sealed class HighlightPanel : Window
-    {
-        readonly FxSession _fx;
-        readonly TextBox _radius = new TextBox { Text = "0" };
-        readonly TextBox _offset = new TextBox { Text = "10" };
-        readonly TextBox _intensity = new TextBox { Text = "0" };
-
-        public HighlightPanel()
-        {
-            Title = "Highlight Outline";
-            Width = 260; SizeToContent = SizeToContent.Height;
-            ResizeMode = ResizeMode.NoResize; Topmost = true;
-            Owner = Application.Current.MainWindow;
-            WindowStartupLocation = WindowStartupLocation.CenterOwner;
-
-            var panel = new StackPanel { Margin = new Thickness(12) };
-            Row(panel, "Radius", _radius);
-            Row(panel, "Offset", _offset);
-            Row(panel, "Intensity", _intensity);
-            var apply = new Button { Content = "Apply", Margin = new Thickness(0, 8, 0, 0), Padding = new Thickness(0, 4, 0, 4) };
-            apply.Click += (s, e) => Apply();
-            panel.Children.Add(apply);
-            Content = panel;
-
-            _fx = new FxSession();   // adds Inner Shadow + fill opacity 0
-            Push(_radius, _fx.SetRadius);
-            Push(_offset, _fx.SetOffset);
-            Push(_intensity, _fx.SetIntensity);
-            _radius.TextChanged += (s, e) => Push(_radius, _fx.SetRadius);
-            _offset.TextChanged += (s, e) => Push(_offset, _fx.SetOffset);
-            _intensity.TextChanged += (s, e) => Push(_intensity, _fx.SetIntensity);
-            Closed += (s, e) => _fx.Dispose();
-        }
-
-        static void Row(Panel p, string label, TextBox box)
-        {
-            p.Children.Add(new TextBlock { Text = label, Margin = new Thickness(0, 4, 0, 2) });
-            p.Children.Add(box);
-        }
-
-        static void Push(TextBox box, Action<double> setter)
-        {
-            if (double.TryParse(box.Text, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out var v))
-            {
-                try { setter(v); }
-                catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Set FX value failed", ex); }
-            }
-        }
-
-        void Apply()
-        {
-            try
-            {
-                var t = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Commands.RasteriseCommand");
-                var cmd = Activator.CreateInstance(t);
-                var canExec = (bool)t.GetMethod("CanExecute").Invoke(cmd, new object[] { null });
-                if (!canExec) { HighlightOutlinePlugin.Ctx?.LogWarning("Rasterise not available for selection"); return; }
-
-                HighlightOutlinePlugin.SuppressRasteriseDialog = true;
-                try { t.GetMethod("Execute").Invoke(cmd, new object[] { null }); }
-                finally { HighlightOutlinePlugin.SuppressRasteriseDialog = false; }
-                Close();
-            }
-            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Apply failed", ex); }
-        }
     }
 }
