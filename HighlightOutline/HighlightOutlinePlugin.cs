@@ -209,7 +209,7 @@ namespace HighlightOutline
     internal sealed class FxModel : System.ComponentModel.INotifyPropertyChanged
     {
         public event System.ComponentModel.PropertyChangedEventHandler PropertyChanged;
-        double _opacity = 100, _fill = 0, _radius = 0, _offset = 10, _intensity = 0, _angle = 315;
+        double _opacity = 50, _fill = 0, _radius = 0, _offset = 0, _intensity = 0, _angle = 315;
 
         public double Opacity { get { return _opacity; } set { Set(ref _opacity, value, "Opacity"); } }          // %
         public double FillOpacity { get { return _fill; } set { Set(ref _fill, value, "FillOpacity"); } }       // %
@@ -248,6 +248,7 @@ namespace HighlightOutline
             var enabled = (bool)ItemType.GetProperty("IsEnabled").GetValue(_item);
             if (!enabled) _dsType.GetMethod("EnableEffect").Invoke(_ds, new[] { _item });
 
+            SetBlendNormal();
             HighlightOutlinePlugin.Ctx?.Log("Inner Shadow params: " + string.Join(", ", Params().Select(p => p.GetType().Name)));
         }
 
@@ -255,6 +256,26 @@ namespace HighlightOutline
 
         System.Collections.Generic.List<object> Params() =>
             ((IEnumerable)ItemType.GetProperty("Params").GetValue(_item)).Cast<object>().ToList();
+
+        // Blend mode defaults to Normal (enum type resolved at runtime from CurrentBlendMode).
+        void SetBlendNormal()
+        {
+            try
+            {
+                foreach (var p in Params().Where(x => x.GetType().Name == "EffectsDataSourceItemBlendModesParam"))
+                {
+                    var prop = p.GetType().GetProperty("CurrentBlendMode");
+                    var pt = Nullable.GetUnderlyingType(prop.PropertyType) ?? prop.PropertyType;
+                    if (!pt.IsEnum) continue;
+                    var normal = Enum.Parse(pt, "Normal");
+                    _dsType.GetMethod("BeginEditEffect").Invoke(_ds, new[] { p });
+                    prop.SetValue(p, normal);
+                    _dsType.GetMethod("ContinueEditEffect").Invoke(_ds, new[] { p });
+                    _dsType.GetMethod("EndEditEffect").Invoke(_ds, new[] { p });
+                }
+            }
+            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Set blend Normal failed", ex); }
+        }
 
         /// <summary>The current Inner Shadow colour (Persona Colour object).</summary>
         public object GetColour()
@@ -338,7 +359,7 @@ namespace HighlightOutline
 
             var win = CreateWindow();
             win.Title = "Highlight Outline";
-            win.Width = 360;
+            win.Width = 440;
             win.SizeToContent = SizeToContent.Height;
             win.ResizeMode = ResizeMode.NoResize;
             win.Topmost = true;
@@ -348,19 +369,17 @@ namespace HighlightOutline
                 win.WindowStartupLocation = WindowStartupLocation.CenterOwner;
             }
 
-            var grid = new Grid { Margin = new Thickness(14) };
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(95) });
+            var grid = new Grid { Margin = new Thickness(20, 16, 20, 16) };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(80) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            AddRow(grid, "Opacity (%)", Ui.NumberSlider(model, "Opacity", 0, 100, 0));
-            AddRow(grid, "Fill opacity (%)", Ui.NumberSlider(model, "FillOpacity", 0, 100, 0));
-            AddRow(grid, "Radius (px)", Ui.NumberSlider(model, "Radius", 0, 100, 1));
-            AddRow(grid, "Offset (px)", Ui.NumberSlider(model, "Offset", 0, 200, 1));
-            AddRow(grid, "Intensity (%)", Ui.NumberSlider(model, "Intensity", 0, 100, 0));
-            AddRow(grid, "Angle (\u00B0)", Ui.NumberSlider(model, "Angle", 0, 360, 0));
+            // Same rows as the design: Opacity, Offset, Angle, Color (Radius/Fill/Intensity stay at fixed defaults).
+            AddRow(grid, "Opacity:", Ui.NumberSlider(model, "Opacity", 0, 100, 0, "Percentage", true), 10);
+            AddRow(grid, "Offset:", Ui.NumberSlider(model, "Offset", 0, 200, 0, "Pixel", false), 14);
+            AddRow(grid, "Angle:", Ui.AngleDial(model, "Angle"), 14);
 
             var colour = Ui.ColourButton(fx.GetColour(), fx.SetColour);
-            if (colour != null) AddRow(grid, "Color", colour);
+            if (colour != null) AddRow(grid, "Color:", colour, 14);
 
             var apply = new Button { Content = "Apply", Margin = new Thickness(0, 14, 0, 0), Padding = new Thickness(0, 5, 0, 5) };
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -382,13 +401,13 @@ namespace HighlightOutline
             return win;
         }
 
-        static void AddRow(Grid grid, string label, FrameworkElement control)
+        static void AddRow(Grid grid, string label, FrameworkElement control, double top = 12)
         {
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             int row = grid.RowDefinitions.Count - 1;
-            var tb = new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 8, 4) };
+            var tb = new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, top, 8, 0) };
             Ui.StyleLabel(tb);
-            control.Margin = new Thickness(0, 4, 0, 4);
+            control.Margin = new Thickness(0, top, 0, 0);
             control.VerticalAlignment = VerticalAlignment.Center;
             Grid.SetRow(tb, row); Grid.SetRow(control, row); Grid.SetColumn(control, 1);
             grid.Children.Add(tb); grid.Children.Add(control);
@@ -442,24 +461,81 @@ namespace HighlightOutline
             tb.Foreground = System.Windows.Media.Brushes.Gainsboro;
         }
 
-        public static FrameworkElement NumberSlider(object model, string prop, double min, double max, int precision)
+        // Checkerboard + transparent->dark gradient, used as the Opacity track backdrop.
+        static FrameworkElement CheckerTrack()
+        {
+            var checker = new System.Windows.Media.DrawingBrush
+            {
+                TileMode = System.Windows.Media.TileMode.Tile,
+                Viewport = new Rect(0, 0, 8, 8),
+                ViewportUnits = System.Windows.Media.BrushMappingMode.Absolute,
+                Drawing = new System.Windows.Media.DrawingGroup
+                {
+                    Children =
+                    {
+                        new System.Windows.Media.GeometryDrawing(System.Windows.Media.Brushes.White, null, new System.Windows.Media.RectangleGeometry(new Rect(0, 0, 8, 8))),
+                        new System.Windows.Media.GeometryDrawing(System.Windows.Media.Brushes.LightGray, null, new System.Windows.Media.GeometryGroup
+                        {
+                            Children = { new System.Windows.Media.RectangleGeometry(new Rect(0, 0, 4, 4)), new System.Windows.Media.RectangleGeometry(new Rect(4, 4, 4, 4)) }
+                        })
+                    }
+                }
+            };
+            var fade = new System.Windows.Media.LinearGradientBrush(
+                System.Windows.Media.Color.FromArgb(0, 30, 30, 30), System.Windows.Media.Color.FromArgb(255, 30, 30, 30), 0);
+            var g = new Grid { Height = 12, IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+            g.Children.Add(new Border { Background = checker, CornerRadius = new CornerRadius(6) });
+            g.Children.Add(new Border { Background = fade, CornerRadius = new CornerRadius(6) });
+            return g;
+        }
+
+        /// <summary>Affinity RoundSlider (circular angle dial with degree readout).</summary>
+        public static FrameworkElement AngleDial(object model, string prop)
+        {
+            try
+            {
+                var t = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.UI.Controls.RoundSlider", true);
+                var dial = (Control)Activator.CreateInstance(t);
+                var dp = (DependencyProperty)t.GetField("AngleProperty", BindingFlags.Public | BindingFlags.Static).GetValue(null);
+                var b = new Binding(prop) { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged };
+                if (dp.PropertyType != typeof(double))
+                {
+                    Resolve();
+                    b.Converter = new DoubleToUnitValue(_unitValue, Enum.Parse(_unitType, "Degree"));
+                }
+                dial.SetBinding(dp, b);
+                SetDp(t, dial, "FullDegreeMode", true);
+                SetDp(t, dial, "Precision", 0);
+                dial.Width = 64; dial.Height = 64;
+                dial.HorizontalAlignment = HorizontalAlignment.Left;
+                return dial;
+            }
+            catch (Exception ex)
+            {
+                HighlightOutlinePlugin.Ctx?.LogWarning("RoundSlider failed, using slider: " + ex.Message);
+                return NumberSlider(model, prop, 0, 360, 0, "Degree", false);
+            }
+        }
+
+        public static FrameworkElement NumberSlider(object model, string prop, double min, double max, int precision, string unit = "Number", bool checker = false)
         {
             Resolve();
             var binding = new Binding(prop) { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged };
             try
             {
                 if (_range == null || _editor == null || _unitValue == null) throw new InvalidOperationException("no Serif controls");
-                var number = Enum.Parse(_unitType, "Number");
+                var number = Enum.Parse(_unitType, unit);
 
                 var slider = (Slider)Activator.CreateInstance(_range);
                 slider.Minimum = min; slider.Maximum = max;
+                slider.VerticalAlignment = VerticalAlignment.Center;
                 slider.SetBinding(System.Windows.Controls.Primitives.RangeBase.ValueProperty, binding);
 
                 var editor = (Control)Activator.CreateInstance(_editor);
                 SetDp(_editor, editor, "Precision", (int?)precision);
                 _editor.GetProperty("OutputUnitType")?.SetValue(editor, number);
-                editor.Width = 65;
-                editor.Margin = new Thickness(6, 0, 0, 0);
+                editor.Width = 72;
+                editor.Margin = new Thickness(12, 0, 0, 0);
                 var dp = (DependencyProperty)_editor.GetField("UnitValueProperty", BindingFlags.Public | BindingFlags.Static).GetValue(null);
                 BindingOperations.SetBinding(editor, dp, new Binding(prop)
                 {
@@ -473,6 +549,7 @@ namespace HighlightOutline
                 g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 Grid.SetColumn(editor, 1);
+                if (checker) g.Children.Add(CheckerTrack());
                 g.Children.Add(slider); g.Children.Add(editor);
                 return g;
             }
@@ -519,7 +596,7 @@ namespace HighlightOutline
                 btn.SetValue(dp, initial);
                 System.ComponentModel.DependencyPropertyDescriptor.FromProperty(dp, t)
                     .AddValueChanged(btn, (s, e) => changed(btn.GetValue(dp)));
-                btn.Width = 80; btn.Height = 22; btn.HorizontalAlignment = HorizontalAlignment.Left;
+                btn.Width = 170; btn.Height = 30; btn.HorizontalAlignment = HorizontalAlignment.Left;
                 return btn;
             }
             catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Colour button failed", ex); return null; }
