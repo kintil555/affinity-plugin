@@ -21,12 +21,15 @@ namespace HighlightOutline
         {
             Ctx = context;
 
-            // Layer context menu: add Tools > Highlight Outline
+            // Right-click menu (AffinityContextMenu): remove our items before UpdateState, add after
             context.Patch("Layer context menu", h =>
             {
-                var t = Asm(AffinityAsm).GetType("Serif.Affinity.UI.Studio.LayerPage", true);
-                var m = t.GetMethod("GetContextMenu", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                h.Patch(m, postfix: new HarmonyMethod(typeof(HighlightOutlinePlugin), nameof(GetContextMenu_Postfix)));
+                var t = Asm(AffinityAsm).GetType("Serif.Affinity.UI.AffinityContextMenu", true);
+                var m = t.GetMethod("OnOpened", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                h.Patch(m,
+                    prefix: new HarmonyMethod(typeof(HighlightOutlinePlugin), nameof(OnOpened_Prefix)),
+                    postfix: new HarmonyMethod(typeof(HighlightOutlinePlugin), nameof(OnOpened_Postfix)));
+                context.Log("Patched AffinityContextMenu.OnOpened");
             });
 
             // Skip the rasterise dialog (Preserve Layer FX = off) when we trigger it
@@ -47,19 +50,33 @@ namespace HighlightOutline
             return false;
         }
 
-        public static void GetContextMenu_Postfix(ref ContextMenu __result)
+        const string MenuTag = "apl-highlight";
+
+        // UpdateState casts every item to WorkspaceMenuItem, so our plain items must be gone before it runs.
+        public static void OnOpened_Prefix(ContextMenu __instance)
         {
             try
             {
-                if (__result == null) return;
-                if (__result.Items.OfType<MenuItem>().Any(i => (string)i.Tag == "apl-highlight")) return;
+                foreach (var i in __instance.Items.OfType<FrameworkElement>().Where(i => (string)i.Tag == MenuTag).ToList())
+                    __instance.Items.Remove(i);
+            }
+            catch (Exception ex) { Ctx?.LogError("Context menu cleanup failed", ex); }
+        }
 
-                var tools = new MenuItem { Header = "Tools", Tag = "apl-highlight" };
+        public static void OnOpened_Postfix(ContextMenu __instance)
+        {
+            try
+            {
+                var headers = __instance.Items.OfType<MenuItem>().Select(i => i.Header as string).ToList();
+                // Only the layer/object menu (has Duplicate + Merge Down)
+                int dup = headers.IndexOf("Duplicate");
+                if (dup < 0 || !headers.Contains("Merge Down")) return;
+
+                var tools = new MenuItem { Header = "Tools", Tag = MenuTag };
                 var item = new MenuItem { Header = "Highlight Outline" };
                 item.Click += (s, e) => OpenPanel();
                 tools.Items.Add(item);
-                __result.Items.Add(new Separator());
-                __result.Items.Add(tools);
+                __instance.Items.Insert(dup + 1, tools);
             }
             catch (Exception ex) { Ctx?.LogError("Context menu patch failed", ex); }
         }
