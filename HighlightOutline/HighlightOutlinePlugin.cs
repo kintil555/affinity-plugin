@@ -303,7 +303,7 @@ namespace HighlightOutline
         }
 
         // Params the dialog UI is bound to (CurrentParams); fall back to the item's full list.
-        IEnumerable<object> Params()
+        System.Collections.Generic.IEnumerable<object> Params()
         {
             var cur = (_dsType.GetProperty("CurrentParams")?.GetValue(_ds) as IEnumerable)?.Cast<object>().ToList();
             if (cur != null && cur.Count > 0) return cur;
