@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Data;
 using HarmonyLib;
 using AffinityPluginLoader;
 
@@ -136,62 +137,23 @@ namespace HighlightOutline
             return tb.CreateType();
         }
 
-        static object _dialog;      // Affinity's native LayerEffectsDialog
-        static bool _applyRequested;
+        static Window _panel;
 
-        // Opens Affinity's own Layer Effects dialog (native UI: colour picker, opacity, angle, radius...)
-        // on the current selection with Inner Shadow preselected and our defaults applied.
+        // Opens our compact panel (Affinity-styled controls) on the current selection.
         public static void OpenPanel()
         {
             try
             {
-                var selection = GetSelection();
-                var shadowType = PType("Serif.Interop.Persona.Data.EffectsDataSourceItemInnerShadow");
-
-                var panelIface = FindType("IPanelService");
-                var panelSvc = GetService(panelIface);
-                panelSvc.GetType().GetMethod("ShowLayerEffectsDialog").Invoke(panelSvc, new object[] { selection, shadowType });
-
-                const BindingFlags nb = BindingFlags.NonPublic | BindingFlags.Instance;
-                var dlg = panelSvc.GetType().GetField("layerEffectsDialog", nb).GetValue(panelSvc);
-                var ds = dlg.GetType().GetField("_dataSource", nb).GetValue(dlg);
-                if (ReferenceEquals(dlg, _dialog)) return;     // already open and initialised
-                _dialog = dlg;
-
-                var win = (Window)dlg;
-                HookApplyButton(win);
-                var fx = new FxSession(ds);
-                fx.ApplyDefaults();                         // now
-                win.Dispatcher.BeginInvoke(new Action(fx.ApplyDefaults),
-                    System.Windows.Threading.DispatcherPriority.ApplicationIdle);   // again once the UI has bound
+                if (_panel != null) { _panel.Activate(); return; }
+                _panel = HighlightPanel.Build(RasteriseSelection);
+                _panel.Closed += (s, e) => _panel = null;
+                _panel.Show();
             }
-            catch (Exception ex) { Ctx?.LogError("Open panel failed", ex); }
-        }
-
-        // Reuse the dialog's accept button as "Apply": it closes the dialog (committing the FX),
-        // then we rasterise without preserving layer FX.
-        static void HookApplyButton(Window dlg)
-        {
-            var btn = dlg.GetType().GetField("AcceptButton", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                         ?.GetValue(dlg) as Button;
-            if (btn != null)
-            {
-                btn.Content = "Apply";
-                btn.Click += (s, e) => _applyRequested = true;
-            }
-            else Ctx?.LogWarning("Dialog accept button not found; closing the dialog will not rasterise");
-
-            dlg.Closed += (s, e) =>
-            {
-                _dialog = null;
-                if (!_applyRequested) return;
-                _applyRequested = false;
-                dlg.Dispatcher.BeginInvoke(new Action(RasteriseSelection));
-            };
+            catch (Exception ex) { _panel = null; Ctx?.LogError("Open panel failed", ex); }
         }
 
         // Rasterise with "Preserve Layer FX" off so the FX become plain pixels.
-        static void RasteriseSelection()
+        internal static void RasteriseSelection()
         {
             try
             {
@@ -223,17 +185,18 @@ namespace HighlightOutline
             return doc.GetType().GetProperty("Selection").GetValue(doc);
         }
 
-        internal static Type FindType(string name)
+        internal static Type FindTypeAnywhere(string name)
         {
-            foreach (var asm in new[] { Asm(AffinityAsm), Asm(PersonaAsm) })
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies().Where(a => a.GetName().Name.StartsWith("Serif")))
             {
                 Type[] types;
                 try { types = asm.GetTypes(); }
                 catch (ReflectionTypeLoadException e) { types = e.Types.Where(x => x != null).ToArray(); }
+                catch { continue; }
                 var t = types.FirstOrDefault(x => x.Name == name);
                 if (t != null) return t;
             }
-            throw new TypeLoadException(name);
+            return null;
         }
 
         internal static Assembly Asm(string name) =>
@@ -242,85 +205,351 @@ namespace HighlightOutline
         internal static Type PType(string full) => Asm(PersonaAsm).GetType(full, true);
     }
 
-    /// <summary>Wraps Affinity's EffectsDataSource to edit Inner Shadow on the current selection.</summary>
-    internal sealed class FxSession
+    /// <summary>Values edited in the panel.</summary>
+    internal sealed class FxModel : System.ComponentModel.INotifyPropertyChanged
+    {
+        public event System.ComponentModel.PropertyChangedEventHandler PropertyChanged;
+        double _opacity = 100, _fill = 0, _radius = 0, _offset = 10, _intensity = 0, _angle = 315;
+
+        public double Opacity { get { return _opacity; } set { Set(ref _opacity, value, "Opacity"); } }          // %
+        public double FillOpacity { get { return _fill; } set { Set(ref _fill, value, "FillOpacity"); } }       // %
+        public double Radius { get { return _radius; } set { Set(ref _radius, value, "Radius"); } }             // px
+        public double Offset { get { return _offset; } set { Set(ref _offset, value, "Offset"); } }             // px
+        public double Intensity { get { return _intensity; } set { Set(ref _intensity, value, "Intensity"); } } // %
+        public double Angle { get { return _angle; } set { Set(ref _angle, value, "Angle"); } }                 // degrees
+
+        void Set(ref double f, double v, string name)
+        {
+            if (f == v) return;
+            f = v;
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(name));
+        }
+    }
+
+    /// <summary>Drives Affinity's EffectsDataSource: Inner Shadow on the current selection, live preview.</summary>
+    internal sealed class FxSession : IDisposable
     {
         readonly object _ds;
         readonly object _item;
         readonly Type _dsType;
 
-        public FxSession(object dataSource)
+        public FxSession()
         {
-            _ds = dataSource;
-            _dsType = _ds.GetType();
-            var effects = (IEnumerable)_dsType.GetProperty("Effects").GetValue(_ds);
-            _item = effects.Cast<object>().First(e => e.GetType().Name == "EffectsDataSourceItemInnerShadow");
+            var app = Application.Current;
+            _dsType = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.EffectsDataSource");
+            _ds = Activator.CreateInstance(_dsType, app, false);
+            _dsType.GetMethod("Initialise").Invoke(_ds, new[] { HighlightOutlinePlugin.GetSelection() });
+            _dsType.GetMethod("Activate").Invoke(_ds, null);
+
+            var effects = ((IEnumerable)_dsType.GetProperty("Effects").GetValue(_ds)).Cast<object>().ToList();
+            _item = effects.First(e => e.GetType().Name == "EffectsDataSourceItemInnerShadow");
+            _dsType.GetProperty("CurrentEffect").SetValue(_ds, effects.IndexOf(_item));
+
+            var enabled = (bool)ItemType.GetProperty("IsEnabled").GetValue(_item);
+            if (!enabled) _dsType.GetMethod("EnableEffect").Invoke(_ds, new[] { _item });
+
+            HighlightOutlinePlugin.Ctx?.Log("Inner Shadow params: " + string.Join(", ", Params().Select(p => p.GetType().Name)));
         }
 
-        // Defaults (all editable afterwards in the dialog).
-        const double EffectOpacity = 1.0;   // "Opacity" slider of the Inner Shadow, 0..1 (100%)
-        const double FillOpacityPct = 0.0;  // "Fill Opacity" of the layer (0%)
-        const double Radius = 0, Offset = 10, Intensity = 0;
+        static Type ItemType { get { return HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.IEffectsDataSourceItem"); } }
 
-        /// <summary>Enable Inner Shadow and set: opacity 100%, radius 0, offset 10, intensity 0, fill opacity 0%.</summary>
-        public void ApplyDefaults()
+        System.Collections.Generic.List<object> Params() =>
+            ((IEnumerable)ItemType.GetProperty("Params").GetValue(_item)).Cast<object>().ToList();
+
+        /// <summary>The current Inner Shadow colour (Persona Colour object).</summary>
+        public object GetColour()
         {
-            Step("enable effect", () =>
+            var p = Params().FirstOrDefault(x => x.GetType().Name == "EffectsDataSourceItemColourParam");
+            return p?.GetType().GetProperty("Value").GetValue(p);
+        }
+
+        public void SetColour(object colour) { SetAll("EffectsDataSourceItemColourParam", "Value", colour); }
+
+        public void PushAll(FxModel m)
+        {
+            foreach (var n in new[] { "Opacity", "FillOpacity", "Radius", "Offset", "Intensity", "Angle" }) Push(n, m);
+        }
+
+        public void Push(string name, FxModel m)
+        {
+            try
             {
-                var enabled = (bool)HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.IEffectsDataSourceItem")
-                    .GetProperty("IsEnabled").GetValue(_item);
-                if (!enabled) _dsType.GetMethod("EnableEffect").Invoke(_ds, new[] { _item });
-            });
-            Step("fill opacity", SetFillOpacity);
-            Step("opacity", () => SetParam("EffectsDataSourceItemOpacityParam", "Value", EffectOpacity));
-            Step("radius", () => SetParam("EffectsDataSourceItemRadiusParam", "Value", Radius));
-            Step("offset", () =>
-            {
-                if (Param("EffectsDataSourceItemOffsetParam") != null) SetParam("EffectsDataSourceItemOffsetParam", "Value", Offset);
-                else SetParam("EffectsDataSourceItemOffsetAngleParam", "Value1", Offset);   // Value1 = offset, Value2 = angle
-            });
-            Step("intensity", () => SetParam("EffectsDataSourceItemIntensityParam", "Value", Intensity));
+                switch (name)
+                {
+                    case "Opacity": SetAll("EffectsDataSourceItemOpacityParam", "Value", m.Opacity / 100.0); break;
+                    case "FillOpacity": SetFillOpacity(m.FillOpacity); break;
+                    case "Radius": SetAll("EffectsDataSourceItemRadiusParam", "Value", m.Radius); break;
+                    case "Intensity": SetAll("EffectsDataSourceItemIntensityParam", "Value", m.Intensity / 100.0); break;
+                    case "Offset":
+                        SetAll("EffectsDataSourceItemOffsetAngleParam", "Value1", m.Offset);   // Value1 = offset (px)
+                        SetAll("EffectsDataSourceItemOffsetParam", "Value1", m.Offset);
+                        break;
+                    case "Angle":
+                        SetAll("EffectsDataSourceItemOffsetAngleParam", "Value2", m.Angle);    // Value2 = angle (degrees)
+                        SetAll("EffectsDataSourceItemAngleParam", "Value1", m.Angle);
+                        break;
+                }
+            }
+            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Set '" + name + "' failed", ex); }
         }
 
-        static void Step(string name, Action a)
-        {
-            try { a(); }
-            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Default '" + name + "' failed", ex); }
-        }
-
-        void SetFillOpacity()
+        void SetFillOpacity(double pct)
         {
             var uv = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitValue");
             var ut = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitType");
-            // UnitValue has two (double, UnitType) ctors differing only by modopt, so pick one explicitly.
             var ctor = uv.GetConstructors().First(c =>
             {
                 var ps = c.GetParameters();
                 return ps.Length == 2 && ps[0].ParameterType == typeof(double) && ps[1].ParameterType == ut;
             });
-            var val = ctor.Invoke(new object[] { FillOpacityPct, Enum.Parse(ut, "Percentage") });
-            _dsType.GetProperty("FillOpacity").SetValue(_ds, val);
+            _dsType.GetProperty("FillOpacity").SetValue(_ds, ctor.Invoke(new object[] { pct, Enum.Parse(ut, "Percentage") }));
         }
 
-        // Params the dialog UI is bound to (CurrentParams); fall back to the item's full list.
-        System.Collections.Generic.IEnumerable<object> Params()
+        void SetAll(string paramType, string prop, object value)
         {
-            var cur = (_dsType.GetProperty("CurrentParams")?.GetValue(_ds) as IEnumerable)?.Cast<object>().ToList();
-            if (cur != null && cur.Count > 0) return cur;
-            return ((IEnumerable)HighlightOutlinePlugin.PType("Serif.Interop.Persona.Data.IEffectsDataSourceItem")
-                .GetProperty("Params").GetValue(_item)).Cast<object>();
+            foreach (var p in Params().Where(x => x.GetType().Name == paramType))
+            {
+                try
+                {
+                    _dsType.GetMethod("BeginEditEffect").Invoke(_ds, new[] { p });
+                    p.GetType().GetProperty(prop).SetValue(p, value);
+                    _dsType.GetMethod("ContinueEditEffect").Invoke(_ds, new[] { p });
+                    _dsType.GetMethod("EndEditEffect").Invoke(_ds, new[] { p });
+                }
+                catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError(paramType + "." + prop + " failed", ex); }
+            }
         }
 
-        object Param(string typeName) => Params().FirstOrDefault(p => p.GetType().Name == typeName);
-
-        void SetParam(string typeName, string prop, double v)
+        public void Dispose()
         {
-            var p = Param(typeName);
-            if (p == null) { HighlightOutlinePlugin.Ctx?.LogWarning("Param not found: " + typeName); return; }
-            _dsType.GetMethod("BeginEditEffect").Invoke(_ds, new[] { p });
-            p.GetType().GetProperty(prop).SetValue(p, v);
-            _dsType.GetMethod("ContinueEditEffect").Invoke(_ds, new[] { p });
-            _dsType.GetMethod("EndEditEffect").Invoke(_ds, new[] { p });
+            try { _dsType.GetMethod("OnClose").Invoke(_ds, null); } catch { }
+            try { _dsType.GetMethod("Deactivate").Invoke(_ds, null); } catch { }
+            (_ds as IDisposable)?.Dispose();
         }
+    }
+
+    /// <summary>Compact panel built from Affinity's own controls (falls back to plain WPF ones).</summary>
+    internal static class HighlightPanel
+    {
+        public static Window Build(Action rasterise)
+        {
+            var fx = new FxSession();
+            var model = new FxModel();
+
+            var win = CreateWindow();
+            win.Title = "Highlight Outline";
+            win.Width = 360;
+            win.SizeToContent = SizeToContent.Height;
+            win.ResizeMode = ResizeMode.NoResize;
+            win.Topmost = true;
+            if (Application.Current.MainWindow != null && Application.Current.MainWindow != win)
+            {
+                win.Owner = Application.Current.MainWindow;
+                win.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            }
+
+            var grid = new Grid { Margin = new Thickness(14) };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(95) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            AddRow(grid, "Opacity (%)", Ui.NumberSlider(model, "Opacity", 0, 100, 0));
+            AddRow(grid, "Fill opacity (%)", Ui.NumberSlider(model, "FillOpacity", 0, 100, 0));
+            AddRow(grid, "Radius (px)", Ui.NumberSlider(model, "Radius", 0, 100, 1));
+            AddRow(grid, "Offset (px)", Ui.NumberSlider(model, "Offset", 0, 200, 1));
+            AddRow(grid, "Intensity (%)", Ui.NumberSlider(model, "Intensity", 0, 100, 0));
+            AddRow(grid, "Angle (\u00B0)", Ui.NumberSlider(model, "Angle", 0, 360, 0));
+
+            var colour = Ui.ColourButton(fx.GetColour(), fx.SetColour);
+            if (colour != null) AddRow(grid, "Color", colour);
+
+            var apply = new Button { Content = "Apply", Margin = new Thickness(0, 14, 0, 0), Padding = new Thickness(0, 5, 0, 5) };
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            Grid.SetRow(apply, grid.RowDefinitions.Count - 1);
+            Grid.SetColumnSpan(apply, 2);
+            grid.Children.Add(apply);
+            win.Content = grid;
+
+            bool applied = false;
+            apply.Click += (s, e) => { applied = true; win.Close(); };
+            win.Closed += (s, e) =>
+            {
+                fx.Dispose();                                   // commits the FX to the layer
+                if (applied) win.Dispatcher.BeginInvoke(rasterise);   // FX -> pixels, Preserve Layer FX off
+            };
+
+            model.PropertyChanged += (s, e) => fx.Push(e.PropertyName, model);
+            fx.PushAll(model);                                  // defaults: radius 0, offset 10, intensity 0, fill 0%
+            return win;
+        }
+
+        static void AddRow(Grid grid, string label, FrameworkElement control)
+        {
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            int row = grid.RowDefinitions.Count - 1;
+            var tb = new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 8, 4) };
+            Ui.StyleLabel(tb);
+            control.Margin = new Thickness(0, 4, 0, 4);
+            control.VerticalAlignment = VerticalAlignment.Center;
+            Grid.SetRow(tb, row); Grid.SetRow(control, row); Grid.SetColumn(control, 1);
+            grid.Children.Add(tb); grid.Children.Add(control);
+        }
+
+        // Affinity's own dialog chrome when available.
+        static Window CreateWindow()
+        {
+            try
+            {
+                var t = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.UI.AffinityDialog", true);
+                return (Window)Activator.CreateInstance(t);
+            }
+            catch (Exception ex)
+            {
+                HighlightOutlinePlugin.Ctx?.LogWarning("AffinityDialog unavailable, using plain window: " + ex.Message);
+                return new Window();
+            }
+        }
+    }
+
+    /// <summary>Affinity control factory (RangeSlider + UnitEditor, ColourPickerButton) with WPF fallbacks.</summary>
+    internal static class Ui
+    {
+        static Type _range, _editor, _unitValue, _unitType;
+        static bool _resolved;
+
+        static void Resolve()
+        {
+            if (_resolved) return;
+            _resolved = true;
+            try
+            {
+                _range = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.UI.Controls.RangeSlider");
+                _editor = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.UI.Units.UnitEditor");
+                _unitValue = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitValue");
+                _unitType = HighlightOutlinePlugin.PType("Serif.Interop.Persona.Units.UnitType");
+            }
+            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogWarning("Serif controls not resolved: " + ex.Message); }
+        }
+
+        public static void StyleLabel(TextBlock tb)
+        {
+            try
+            {
+                var scheme = HighlightOutlinePlugin.Asm("Serif.Affinity").GetType("Serif.Affinity.Resources.Schemes.SchemeManager");
+                var key = scheme?.GetProperty("Brush_LabelForeground", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                if (key != null) { tb.SetResourceReference(TextBlock.ForegroundProperty, key); return; }
+            }
+            catch { }
+            tb.Foreground = System.Windows.Media.Brushes.Gainsboro;
+        }
+
+        public static FrameworkElement NumberSlider(object model, string prop, double min, double max, int precision)
+        {
+            Resolve();
+            var binding = new Binding(prop) { Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged };
+            try
+            {
+                if (_range == null || _editor == null || _unitValue == null) throw new InvalidOperationException("no Serif controls");
+                var number = Enum.Parse(_unitType, "Number");
+
+                var slider = (Slider)Activator.CreateInstance(_range);
+                slider.Minimum = min; slider.Maximum = max;
+                slider.SetBinding(System.Windows.Controls.Primitives.RangeBase.ValueProperty, binding);
+
+                var editor = (Control)Activator.CreateInstance(_editor);
+                SetDp(_editor, editor, "Precision", (int?)precision);
+                _editor.GetProperty("OutputUnitType")?.SetValue(editor, number);
+                editor.Width = 65;
+                editor.Margin = new Thickness(6, 0, 0, 0);
+                var dp = (DependencyProperty)_editor.GetField("UnitValueProperty", BindingFlags.Public | BindingFlags.Static).GetValue(null);
+                BindingOperations.SetBinding(editor, dp, new Binding(prop)
+                {
+                    Source = model,
+                    Mode = BindingMode.TwoWay,
+                    UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged,
+                    Converter = new DoubleToUnitValue(_unitValue, number)
+                });
+
+                var g = new Grid();
+                g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                Grid.SetColumn(editor, 1);
+                g.Children.Add(slider); g.Children.Add(editor);
+                return g;
+            }
+            catch (Exception ex)
+            {
+                HighlightOutlinePlugin.Ctx?.LogWarning("Serif slider failed, using WPF slider: " + ex.Message);
+                var g = new Grid();
+                g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(60) });
+                var sl = new Slider { Minimum = min, Maximum = max };
+                sl.SetBinding(System.Windows.Controls.Primitives.RangeBase.ValueProperty, binding);
+                var box = new TextBox { Margin = new Thickness(6, 0, 0, 0) };
+                box.SetBinding(TextBox.TextProperty, new Binding(prop)
+                {
+                    Source = model, Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus,
+                    StringFormat = precision > 0 ? "F" + precision : "F0"
+                });
+                Grid.SetColumn(box, 1);
+                g.Children.Add(sl); g.Children.Add(box);
+                return g;
+            }
+        }
+
+        /// <summary>Affinity's ColourPickerButton bound to the Persona Colour of the effect; null if unavailable.</summary>
+        public static FrameworkElement ColourButton(object initial, Action<object> changed)
+        {
+            try
+            {
+                var t = HighlightOutlinePlugin.FindTypeAnywhere("ColourPickerButton");
+                if (t == null || initial == null) { HighlightOutlinePlugin.Ctx?.LogWarning("ColourPickerButton not found"); return null; }
+                var btn = (FrameworkElement)Activator.CreateInstance(t);
+
+                DependencyProperty dp = null;
+                for (var tt = t; tt != null && dp == null; tt = tt.BaseType)
+                    foreach (var f in tt.GetFields(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly))
+                    {
+                        if (f.FieldType != typeof(DependencyProperty)) continue;
+                        var d = (DependencyProperty)f.GetValue(null);
+                        if (d.PropertyType != typeof(object) && d.PropertyType.IsAssignableFrom(initial.GetType())
+                            && d.PropertyType.Name.Contains("Colour")) { dp = d; break; }
+                    }
+                if (dp == null) { HighlightOutlinePlugin.Ctx?.LogWarning("ColourPickerButton has no Colour property"); return null; }
+
+                btn.SetValue(dp, initial);
+                System.ComponentModel.DependencyPropertyDescriptor.FromProperty(dp, t)
+                    .AddValueChanged(btn, (s, e) => changed(btn.GetValue(dp)));
+                btn.Width = 80; btn.Height = 22; btn.HorizontalAlignment = HorizontalAlignment.Left;
+                return btn;
+            }
+            catch (Exception ex) { HighlightOutlinePlugin.Ctx?.LogError("Colour button failed", ex); return null; }
+        }
+
+        static void SetDp(Type type, DependencyObject obj, string name, object value)
+        {
+            var f = type.GetField(name + "Property", BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy);
+            if (f != null && value != null) obj.SetValue((DependencyProperty)f.GetValue(null), value);
+        }
+    }
+
+    internal sealed class DoubleToUnitValue : IValueConverter
+    {
+        readonly ConstructorInfo _ctor;
+        readonly PropertyInfo _value;
+        readonly Type _type;
+        readonly object _unit;
+
+        public DoubleToUnitValue(Type unitValue, object unit)
+        {
+            _type = unitValue; _unit = unit;
+            _ctor = unitValue.GetConstructor(new[] { typeof(double), unit.GetType() });
+            _value = unitValue.GetProperty("Value");
+        }
+
+        public object Convert(object v, Type t, object p, System.Globalization.CultureInfo c) =>
+            v is double d ? _ctor.Invoke(new object[] { d, _unit }) : null;
+
+        public object ConvertBack(object v, Type t, object p, System.Globalization.CultureInfo c) =>
+            v != null && _type.IsInstanceOfType(v) ? _value.GetValue(v) : 0.0;
     }
 }
